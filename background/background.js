@@ -62,17 +62,40 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 // ───────────────────────────────────────────────────────
-// 2. TAB MONITORING
+// 2. DEBOUNCE TRACKER & TAB MONITORING
 // ───────────────────────────────────────────────────────
+
+const activeScans = new Map();
+const SCAN_COOLDOWN_MS = 2000;
+
+/**
+ * shouldThrottleScan(url)
+ * Prevents redundant concurrent scans on the same URL within cooldown.
+ */
+function shouldThrottleScan(url) {
+  const now = Date.now();
+  if (activeScans.has(url)) {
+    const lastScanTime = activeScans.get(url);
+    if (now - lastScanTime < SCAN_COOLDOWN_MS) {
+      return true;
+    }
+  }
+  activeScans.set(url, now);
+  if (activeScans.size > 100) {
+    for (const [k, v] of activeScans.entries()) {
+      if (now - v > SCAN_COOLDOWN_MS) {
+        activeScans.delete(k);
+      }
+    }
+  }
+  return false;
+}
 
 /**
  * onActivated fires when the user switches to a different tab.
- * We use this to pre-analyse the new active tab so results are
- * ready when the user opens the popup.
  */
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
-    // Fetch full tab info to get the URL
     const tab = await chrome.tabs.get(activeInfo.tabId);
     if (tab.url && isAnalysableUrl(tab.url)) {
       console.log('[SentinelX BG] Tab activated:', tab.url);
@@ -84,12 +107,9 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 });
 
 /**
- * onUpdated fires when a tab's state changes — including when a
- * navigation completes (status === 'complete').
- * This catches page navigations within the same tab.
+ * onUpdated fires when a tab finishes navigation.
  */
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  // Only act when the page has finished loading AND has a URL
   if (changeInfo.status === 'complete' && tab.url && isAnalysableUrl(tab.url)) {
     console.log('[SentinelX BG] Tab updated:', tab.url);
     await analyseAndStore(tab.url, tabId);
@@ -97,24 +117,13 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 });
 
 // ───────────────────────────────────────────────────────
-// 3. MESSAGE LISTENER (from popup.js and content.js)
+// 3. MESSAGE LISTENER
 // ───────────────────────────────────────────────────────
 
-/**
- * onMessage is the central message bus for the extension.
- * All chrome.runtime.sendMessage() calls are handled here.
- *
- * IMPORTANT: To use sendResponse asynchronously (after an await),
- * the listener MUST return `true`. This keeps the message channel
- * open until sendResponse is called.
- */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   console.log('[SentinelX BG] Message received:', message.type, 'from:', sender.tab?.url ?? 'popup');
 
-  // Route messages by type
   switch (message.type) {
-
-    // ── Popup requests a URL analysis ──
     case 'ANALYSE_URL': {
       handleAnalyseRequest(message.url)
         .then((result) => sendResponse({ result }))
@@ -122,14 +131,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           console.error('[SentinelX BG] Analysis error:', err);
           sendResponse({ error: err.message });
         });
-      return true; // ← keeps channel open for async sendResponse
+      return true;
     }
 
-    // ── Content script reports page info ──
     case 'PAGE_INFO': {
       console.log('[SentinelX BG] Page info from content script:', message.data);
-      sendResponse({ received: true });
-      break;
+      handlePageInfo(message.data, sender)
+        .then(() => sendResponse({ received: true }))
+        .catch((err) => {
+          console.error('[SentinelX BG] handlePageInfo error:', err);
+          sendResponse({ error: err.message });
+        });
+      return true;
     }
 
     default:
@@ -143,28 +156,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 /**
  * handleAnalyseRequest(url)
- * Called when popup.js asks for a URL analysis.
- * Checks storage for a cached result first; otherwise runs fresh analysis.
- *
- * @param {string} url
- * @returns {Promise<Object>} result object
+ * Called by popup.js when opening the popup.
  */
 async function handleAnalyseRequest(url) {
-  // Check cache first (avoid re-running analysis for the same URL)
   const cached = await getCachedResult(url);
   if (cached) {
     console.log('[SentinelX BG] Returning cached result for:', url);
     return cached;
   }
 
-  // Run full analysis
   const result = analyseUrl(url);
-
-  // Persist to storage
   await storeResult(url, result);
 
-  // If high-risk, tell the content script to show a warning banner
-  if (result.score >= 60) {
+  if (result.score >= 51) {
     await notifyContentScript(result);
   }
 
@@ -173,25 +177,97 @@ async function handleAnalyseRequest(url) {
 
 /**
  * analyseAndStore(url, tabId)
- * Background pre-analysis called on tab changes.
- * Results are stored so the popup can retrieve them instantly.
+ * Performs baseline scans on page update.
  */
 async function analyseAndStore(url, tabId) {
   try {
+    if (shouldThrottleScan(url)) {
+      console.log('[SentinelX BG] Throttling redundant scan for:', url);
+      return;
+    }
     const result = analyseUrl(url);
     await storeResult(url, result);
 
-    // Notify content script if suspicious
-    if (result.score >= 60) {
+    if (result.score >= 51) {
       chrome.tabs.sendMessage(tabId, {
         type: 'SHOW_WARNING',
         data: result,
-      }).catch(() => {
-        // Content script may not be ready yet — silently ignore
-      });
+      }).catch(() => {});
     }
   } catch (err) {
     console.error('[SentinelX BG] analyseAndStore error:', err);
+  }
+}
+
+/**
+ * handlePageInfo(data, sender)
+ * Merges content-based findings reported by content.js DOM scanner.
+ */
+async function handlePageInfo(data, sender) {
+  const { url, hasPasswordInput, insecureAction, actionDomainMismatch, hasExcessiveHiddenInputs, hasSuspiciousButtons } = data;
+  if (!url) return;
+
+  // Retrieve existing baseline URL scan or generate new
+  let result = await getCachedResult(url);
+  if (!result) {
+    result = analyseUrl(url);
+  }
+
+  // Clear previous content checks (to avoid duplicates on reload)
+  result.checks = result.checks.filter(c => !c.isContentCheck);
+
+  let scoreAdjustment = 0;
+  const contentChecks = [];
+
+  if (hasPasswordInput) {
+    if (!result.isHttps) {
+      scoreAdjustment += 25;
+      contentChecks.push({ label: 'Insecure password field detected on HTTP page', passed: false, isContentCheck: true });
+    } else {
+      contentChecks.push({ label: 'Password field detected (HTTPS secured)', passed: true, isContentCheck: true });
+    }
+  }
+
+  if (insecureAction) {
+    scoreAdjustment += 25;
+    contentChecks.push({ label: 'Insecure HTTP form submission target', passed: false, isContentCheck: true });
+  }
+
+  if (actionDomainMismatch) {
+    scoreAdjustment += 20;
+    contentChecks.push({ label: 'Form action target domain mismatch', passed: false, isContentCheck: true });
+  }
+
+  if (hasExcessiveHiddenInputs) {
+    scoreAdjustment += 15;
+    contentChecks.push({ label: 'Excessive hidden input fields detected', passed: false, isContentCheck: true });
+  }
+
+  if (hasSuspiciousButtons) {
+    if (result.score >= 35) {
+      scoreAdjustment += 15;
+      contentChecks.push({ label: 'Suspicious call-to-action button keywords', passed: false, isContentCheck: true });
+    }
+  }
+
+  if (contentChecks.length > 0) {
+    result.checks = [...result.checks, ...contentChecks];
+    result.score = Math.min(100, result.score + scoreAdjustment);
+
+    // Re-evaluate risk label using unified thresholds
+    if (result.score <= 20)      result.label = 'Safe';
+    else if (result.score <= 50) result.label = 'Moderate Risk';
+    else                         result.label = 'Dangerous';
+  }
+
+  await storeResult(url, result);
+
+  // Trigger warning banner update if threat rating is elevated
+  if (result.score >= 51 && sender.tab?.id) {
+    chrome.tabs.sendMessage(sender.tab.id, {
+      type: 'SHOW_WARNING',
+      data: result
+    }).catch(() => {});
   }
 }
 
@@ -209,6 +285,57 @@ async function analyseAndStore(url, tabId) {
  * @param {string} url - The full URL string to analyse
  * @returns {Object} { score, label, isHttps, checks, url, timestamp }
  */
+/**
+ * detectBrandImpersonation(hostname)
+ * Checks if the hostname resembles a popular brand but is not hosted on an official domain.
+ * Supports character substitutions (leetspeak homoglyphs).
+ */
+function detectBrandImpersonation(hostname) {
+  const brands = [
+    { name: 'paypal', official: ['paypal.com', 'paypal.co.uk'] },
+    { name: 'google', official: ['google.com', 'google.co.in', 'google.net', 'google.org'] },
+    { name: 'microsoft', official: ['microsoft.com', 'microsoftonline.com'] },
+    { name: 'apple', official: ['apple.com'] },
+    { name: 'amazon', official: ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.in'] },
+    { name: 'netflix', official: ['netflix.com'] },
+    { name: 'facebook', official: ['facebook.com'] },
+    { name: 'instagram', official: ['instagram.com'] },
+    { name: 'github', official: ['github.com'] },
+    { name: 'chase', official: ['chase.com'] }
+  ];
+
+  const hostLower = hostname.toLowerCase();
+
+  // Normalize typical leetspeak translations
+  const normalized = hostLower
+    .replace(/0/g, 'o')
+    .replace(/1/g, 'l')
+    .replace(/3/g, 'e')
+    .replace(/4/g, 'a')
+    .replace(/5/g, 's')
+    .replace(/8/g, 'b')
+    .replace(/vv/g, 'w');
+
+  for (const brand of brands) {
+    if (hostLower.includes(brand.name) || normalized.includes(brand.name)) {
+      const isOfficial = brand.official.some(officialDomain => {
+        return hostLower === officialDomain || hostLower.endsWith('.' + officialDomain);
+      });
+      if (!isOfficial) {
+        return { impersonated: true, brand: brand.name };
+      }
+    }
+  }
+  return { impersonated: false };
+}
+
+/**
+ * analyseUrl(url)
+ * Runs advanced heuristics on a URL to evaluate its threat level.
+ *
+ * @param {string} url - Full URL string
+ * @returns {Object} { score, label, isHttps, checks, url, timestamp }
+ */
 function analyseUrl(url) {
   let score = 0;
   const checks = [];
@@ -217,88 +344,124 @@ function analyseUrl(url) {
   try {
     parsedUrl = new URL(url);
   } catch {
-    // Unparseable URL — give it a moderate risk score
     return buildResult(url, 50, [{ label: 'Invalid URL format', passed: false }]);
   }
 
   const { protocol, hostname, pathname, href } = parsedUrl;
 
-  // ── Check 1: HTTPS ───────────────────────────────────
+  // ── 1. Protocol Check (HTTP vs HTTPS) ──
   const isHttps = protocol === 'https:';
   if (!isHttps) {
-    score += 35; // Heavy penalty for plain HTTP
-    checks.push({ label: 'Protocol: HTTP (unencrypted traffic)', passed: false });
+    score += 35;
+    checks.push({ label: 'Protocol: HTTP (unencrypted connection)', passed: false });
   } else {
     checks.push({ label: 'Protocol: HTTPS (encrypted)', passed: true });
   }
 
-  // ── Check 2: IP-based URL ────────────────────────────
-  // Legitimate sites use domain names; IP URLs are suspicious
+  // ── 2. IP-based URL Check ──
   const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
   if (ipRegex.test(hostname)) {
     score += 30;
-    checks.push({ label: 'IP-based URL (no domain name)', passed: false });
+    checks.push({ label: 'IP-based host (no domain name)', passed: false });
   } else {
-    checks.push({ label: 'Domain-based URL', passed: true });
+    checks.push({ label: 'Domain-based host', passed: true });
   }
 
-  // ── Check 3: Suspicious keywords in URL ──────────────
+  // ── 3. Suspicious Keywords Check ──
   const suspiciousKeywords = [
     'login', 'signin', 'verify', 'secure', 'account',
     'update', 'confirm', 'banking', 'paypal', 'ebay',
-    'password', 'credential', 'free-gift', 'prize',
+    'password', 'credential', 'free-gift', 'prize'
   ];
   const lowerHref = href.toLowerCase();
   const matchedKeywords = suspiciousKeywords.filter(kw => lowerHref.includes(kw));
 
   if (matchedKeywords.length > 0) {
-    const penalty = Math.min(matchedKeywords.length * 10, 25); // cap at 25
+    const penalty = Math.min(matchedKeywords.length * 10, 25);
     score += penalty;
     checks.push({
-      label: `Suspicious keywords found: ${matchedKeywords.slice(0, 3).join(', ')}`,
-      passed: false,
+      label: `Suspicious keywords: ${matchedKeywords.slice(0, 3).join(', ')}`,
+      passed: false
     });
   } else {
-    checks.push({ label: 'No suspicious keywords detected', passed: true });
+    checks.push({ label: 'No suspicious URL keywords', passed: true });
   }
 
-  // ── Check 4: Excessively long domain ─────────────────
-  // Long hostnames are a phishing tactic (e.g., paypal.com.secure-update.xyz)
+  // ── 4. Domain Length Check ──
   if (hostname.length > 40) {
     score += 15;
-    checks.push({ label: `Very long domain name (${hostname.length} chars)`, passed: false });
+    checks.push({ label: `Excessive domain length (${hostname.length} chars)`, passed: false });
   } else if (hostname.length > 25) {
     score += 5;
-    checks.push({ label: `Moderately long domain (${hostname.length} chars)`, passed: false, warn: true });
+    checks.push({ label: `Moderate domain length (${hostname.length} chars)`, passed: false, warn: true });
   } else {
-    checks.push({ label: `Domain length normal (${hostname.length} chars)`, passed: true });
+    checks.push({ label: 'Domain length normal', passed: true });
   }
 
-  // ── Check 5: Subdomain depth ─────────────────────────
-  // Many subdomains can indicate phishing (e.g., secure.paypal.verify.evil.com)
+  // ── 5. Subdomain Depth Check ──
   const subdomainParts = hostname.split('.');
-  if (subdomainParts.length > 4) {
+  let depthThreshold = 4;
+  const isDoubleTld = subdomainParts.length > 2 && 
+    ['co', 'com', 'org', 'net', 'gov', 'edu'].includes(subdomainParts[subdomainParts.length - 2]);
+  if (isDoubleTld) {
+    depthThreshold = 5;
+  }
+
+  if (subdomainParts.length > depthThreshold) {
     score += 15;
     checks.push({ label: `Deep subdomain chain (${subdomainParts.length} levels)`, passed: false });
   } else {
-    checks.push({ label: `Normal subdomain depth`, passed: true });
+    checks.push({ label: 'Normal subdomain depth', passed: true });
   }
 
-  // ── Check 6: Suspicious TLDs ─────────────────────────
-  const suspiciousTLDs = ['.tk', '.ml', '.ga', '.cf', '.gq', '.xyz', '.top', '.click', '.loan'];
+  // ── 6. Suspicious TLD Check ──
+  const suspiciousTLDs = ['.tk', '.ml', '.ga', '.cf', '.gq', '.xyz', '.top', '.click', '.loan', '.link', '.zip', '.mov'];
   const hasSuspiciousTLD = suspiciousTLDs.some(tld => hostname.endsWith(tld));
   if (hasSuspiciousTLD) {
     score += 15;
-    checks.push({ label: `High-risk TLD detected`, passed: false });
+    checks.push({ label: 'High-risk TLD detected', passed: false });
   } else {
     checks.push({ label: 'Standard TLD', passed: true });
   }
 
-  // ── Check 7: Special / non-HTTP protocols ────────────
-  if (protocol !== 'http:' && protocol !== 'https:') {
-    // e.g., ftp:, data:, javascript:
-    score += 10;
-    checks.push({ label: `Non-standard protocol: ${protocol}`, passed: false, warn: true });
+  // ── 7. URL Shorteners Check ──
+  const shorteners = [
+    'bit.ly', 'tinyurl.com', 't.co', 'cutt.ly', 'is.gd',
+    'buff.ly', 'ow.ly', 'bl.ink', 'v.gd', 'shorturl.at', 'tiny.cc'
+  ];
+  const isShortener = shorteners.some(s => hostname === s || hostname.endsWith('.' + s));
+  if (isShortener) {
+    score += 25;
+    checks.push({ label: 'URL shortener domain detected', passed: false, warn: true });
+  }
+
+  // ── 8. Excessive Hyphens Check ──
+  const hyphenCount = (hostname.match(/-/g) || []).length;
+  if (hyphenCount > 2) {
+    score += 15;
+    checks.push({ label: `Excessive domain hyphens (${hyphenCount})`, passed: false });
+  }
+
+  // ── 9. Suspicious Brand Impersonation Check ──
+  const brandImpersonation = detectBrandImpersonation(hostname);
+  if (brandImpersonation.impersonated) {
+    score += 30;
+    checks.push({ label: `Brand impersonation: resembles official ${brandImpersonation.brand} domain`, passed: false });
+  } else {
+    checks.push({ label: 'No brand impersonation detected', passed: true });
+  }
+
+  // ── 10. Suspicious Characters/Encoding Check ──
+  const encodedSymbols = (url.match(/%/g) || []).length;
+  const containsAtSymbol = hostname.includes('@');
+  const containsBackslash = pathname.includes('\\');
+
+  if (encodedSymbols > 3 || containsAtSymbol || containsBackslash) {
+    score += 15;
+    let reason = 'Suspicious URL encoding / symbols';
+    if (containsAtSymbol) reason += ' (@ credentials)';
+    if (containsBackslash) reason += ' (backslash obfuscation)';
+    checks.push({ label: reason, passed: false });
   }
 
   // Cap score at 100
@@ -312,10 +475,25 @@ function analyseUrl(url) {
  * Assembles the final result object with a human-readable label.
  */
 function buildResult(url, score, checks, isHttps = true) {
+  // Unified risk thresholds: 0-20 Safe | 21-50 Moderate Risk | 51-100 Dangerous
   let label;
-  if (score < 40)      label = 'Safe';
-  else if (score < 70) label = 'Moderate Risk';
-  else                 label = 'Dangerous';
+  if (score <= 20)      label = 'Safe';
+  else if (score <= 50) label = 'Moderate Risk';
+  else                  label = 'Dangerous';
+
+  // Structured debug log — visible in the background service worker console
+  const failedChecks = checks.filter(c => !c.passed).map(c => c.label);
+  console.group(`%c[SentinelX] Risk Analysis`, 'color:#6366f1;font-weight:bold');
+  console.log(`URL:        ${url}`);
+  console.log(`Risk Score: ${score}/100`);
+  console.log(`Label:      ${label}`);
+  if (failedChecks.length > 0) {
+    console.log(`Penalties:`);
+    failedChecks.forEach(r => console.log(`  ✗ ${r}`));
+  } else {
+    console.log('Penalties:  none — site is clean');
+  }
+  console.groupEnd();
 
   return {
     url,
@@ -342,13 +520,17 @@ function buildResult(url, score, checks, isHttps = true) {
  *
  * Key format: sentinelx_scan:<encoded-url>
  */
+/**
+ * storeResult(url, result)
+ * Saves the analysis result to chrome.storage.local.
+ */
 async function storeResult(url, result) {
-  // Use URL as part of the key (encode to avoid special chars)
   const key = `sentinelx_scan:${encodeURIComponent(url).slice(0, 100)}`;
-
   await chrome.storage.local.set({ [key]: result });
 
-  // Also update the global scan count
+  // Update rolling log scan history
+  await addToHistory(result);
+
   const { sentinelx_scan_count = 0 } = await chrome.storage.local.get('sentinelx_scan_count');
   await chrome.storage.local.set({
     sentinelx_scan_count: sentinelx_scan_count + 1,
@@ -359,9 +541,39 @@ async function storeResult(url, result) {
 }
 
 /**
+ * addToHistory(result)
+ * Updates the rolling log history of up to 10 unique scans.
+ */
+async function addToHistory(result) {
+  try {
+    const data = await chrome.storage.local.get('sentinelx_history');
+    let history = data.sentinelx_history || [];
+
+    // Filter out previous entry of the same URL to keep it unique
+    history = history.filter(h => h.url !== result.url);
+
+    // Prepend the new scan
+    history.unshift({
+      url: result.url,
+      score: result.score,
+      label: result.label,
+      timestamp: Date.now()
+    });
+
+    // Cap at 10 items
+    if (history.length > 10) {
+      history = history.slice(0, 10);
+    }
+
+    await chrome.storage.local.set({ sentinelx_history: history });
+  } catch (err) {
+    console.error('[SentinelX BG] addToHistory error:', err);
+  }
+}
+
+/**
  * getCachedResult(url)
  * Returns a cached result if it's less than 5 minutes old.
- * Prevents redundant re-analysis of the same URL.
  */
 async function getCachedResult(url) {
   const key = `sentinelx_scan:${encodeURIComponent(url).slice(0, 100)}`;
@@ -370,11 +582,10 @@ async function getCachedResult(url) {
 
   if (!cached) return null;
 
-  // Cache TTL: 5 minutes (300,000 ms)
   const age = Date.now() - (cached.timestamp || 0);
   if (age < 300_000) return cached;
 
-  return null; // Cache expired
+  return null;
 }
 
 // ───────────────────────────────────────────────────────
