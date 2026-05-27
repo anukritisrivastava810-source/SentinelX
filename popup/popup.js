@@ -3,9 +3,9 @@
  * SentinelX — popup.js
  *
  * SCORING MODEL (unified):
- *   Risk Score  0–20   → Safe          (green)
- *   Risk Score 21–50   → Moderate Risk (amber)
- *   Risk Score 51–100  → Dangerous     (red)
+ *   Risk Score  0–15   → Safe          (green)
+ *   Risk Score 16–40   → Moderate Risk (amber)
+ *   Risk Score 41–100  → Dangerous     (red)
  *
  * The score displayed is the RAW risk score from the engine.
  * Higher number = more dangerous. There is no "Trust Score" inversion.
@@ -117,7 +117,7 @@ function renderUrlSection(url) {
  */
 function renderResults(result) {
   const { score, label, isHttps, checks, timestamp } = result;
-  const pillClass = labelToCSSClass(label); // 'safe' | 'moderate' | 'danger'
+  const pillClass = labelToCSSClass(label); // 'safe' | 'low' | 'moderate' | 'danger'
 
   console.log(`[SentinelX Popup] Rendering — Risk Score: ${score}, Label: ${label}`);
 
@@ -156,7 +156,7 @@ function renderResults(result) {
 
   // ── Explanation detail ──
   const scoreDetail = document.getElementById('scoreDetail');
-  if (scoreDetail) scoreDetail.textContent = riskDescription(score, isHttps, checks);
+  if (scoreDetail) scoreDetail.innerHTML = riskDescription(score, isHttps, checks);
 
   // ── Risk bar fill (higher score = longer bar = more danger) ──
   const barFill = document.getElementById('riskBarFill');
@@ -325,29 +325,32 @@ function renderError(message) {
 /**
  * riskDescription(score, isHttps, checks)
  *
- * Generates a plain-English explanation aligned with the risk model.
- * Pulls the top failed check reason where possible.
+ * Generates a professional explanation aligned with the risk model.
  */
 function riskDescription(score, isHttps, checks = []) {
-  if (score <= 20) return 'No significant threats detected. This site appears safe.';
+  if (score <= 5) return 'No significant threats detected. This site appears safe.';
 
   // Collect human-readable reasons from failed checks
   const reasons = checks
     .filter(c => !c.passed && !c.warn)
-    .map(c => c.label)
-    .slice(0, 2);
+    .map(c => c.label.toLowerCase())
+    .slice(0, 3); // Get top 3 reasons
 
-  if (score <= 50) {
-    const base = 'Moderate risk detected.';
-    return reasons.length > 0
-      ? `${base} Reasons: ${reasons.join('; ')}.`
-      : `${base} Proceed with caution.`;
+  if (score <= 20) {
+    if (reasons.length === 0) return 'Minor anomalies detected. Generally safe.';
+    const list = reasons.map(r => `<li>${r}</li>`).join('');
+    return `Low risk indicators:<ul style="margin: 4px 0 0 16px; padding: 0;">${list}</ul>`;
   }
 
-  const base = 'High threat level detected!';
-  return reasons.length > 0
-    ? `${base} Reasons: ${reasons.join('; ')}.`
-    : `${base} Avoid entering personal information.`;
+  if (score <= 45) {
+    if (reasons.length === 0) return 'Moderate risk detected. Proceed with caution.';
+    const list = reasons.map(r => `<li>${r}</li>`).join('');
+    return `This site requires caution because:<ul style="margin: 4px 0 0 16px; padding: 0;">${list}</ul>`;
+  }
+
+  if (reasons.length === 0) return 'High threat level detected! Avoid entering personal information.';
+  const list = reasons.map(r => `<li>${r}</li>`).join('');
+  return `This site appears dangerous because:<ul style="margin: 4px 0 0 16px; padding: 0;">${list}</ul>`;
 }
 
 /**
@@ -355,12 +358,14 @@ function riskDescription(score, isHttps, checks = []) {
  * Maps the risk label string to a CSS modifier class.
  *
  * Safe          → 'safe'   (green)
+ * Low Risk      → 'low'    (blue)
  * Moderate Risk → 'moderate' (amber)
  * Dangerous     → 'danger'  (red)
  */
 function labelToCSSClass(label) {
   const map = {
     'Safe':          'safe',
+    'Low Risk':      'low',
     'Moderate Risk': 'moderate',
     'Dangerous':     'danger'
   };

@@ -168,7 +168,7 @@ async function handleAnalyseRequest(url) {
   const result = analyseUrl(url);
   await storeResult(url, result);
 
-  if (result.score >= 51) {
+  if (result.score >= 46) {
     await notifyContentScript(result);
   }
 
@@ -188,7 +188,7 @@ async function analyseAndStore(url, tabId) {
     const result = analyseUrl(url);
     await storeResult(url, result);
 
-    if (result.score >= 51) {
+    if (result.score >= 46) {
       chrome.tabs.sendMessage(tabId, {
         type: 'SHOW_WARNING',
         data: result,
@@ -254,16 +254,17 @@ async function handlePageInfo(data, sender) {
     result.checks = [...result.checks, ...contentChecks];
     result.score = Math.min(100, result.score + scoreAdjustment);
 
-    // Re-evaluate risk label using unified thresholds
-    if (result.score <= 20)      result.label = 'Safe';
-    else if (result.score <= 50) result.label = 'Moderate Risk';
+    // Re-evaluate risk label using unified thresholds (4-tier)
+    if (result.score <= 5)       result.label = 'Safe';
+    else if (result.score <= 20) result.label = 'Low Risk';
+    else if (result.score <= 45) result.label = 'Moderate Risk';
     else                         result.label = 'Dangerous';
   }
 
   await storeResult(url, result);
 
   // Trigger warning banner update if threat rating is elevated
-  if (result.score >= 51 && sender.tab?.id) {
+  if (result.score >= 46 && sender.tab?.id) {
     chrome.tabs.sendMessage(sender.tab.id, {
       type: 'SHOW_WARNING',
       data: result
@@ -286,14 +287,41 @@ async function handlePageInfo(data, sender) {
  * @returns {Object} { score, label, isHttps, checks, url, timestamp }
  */
 /**
+ * levenshtein(a, b)
+ * Calculates the Levenshtein distance between two strings.
+ * Used for lightweight fuzzy matching (typosquatting).
+ */
+function levenshtein(a, b) {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const matrix = [];
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j;
+  }
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, Math.min(matrix[i][j - 1] + 1, matrix[i - 1][j] + 1));
+      }
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+/**
  * detectBrandImpersonation(hostname)
  * Checks if the hostname resembles a popular brand but is not hosted on an official domain.
- * Supports character substitutions (leetspeak homoglyphs).
+ * Supports character substitutions (leetspeak) and edit-distance typosquatting.
  */
 function detectBrandImpersonation(hostname) {
   const brands = [
-    { name: 'paypal', official: ['paypal.com', 'paypal.co.uk'] },
-    { name: 'google', official: ['google.com', 'google.co.in', 'google.net', 'google.org'] },
+    { name: 'paypal', official: ['paypal.com', 'paypal.co.uk', 'paypal.com.au'] },
+    { name: 'google', official: ['google.com', 'google.co.in', 'google.net', 'google.org', 'google.co.uk'] },
     { name: 'microsoft', official: ['microsoft.com', 'microsoftonline.com'] },
     { name: 'apple', official: ['apple.com'] },
     { name: 'amazon', official: ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.in'] },
@@ -301,28 +329,54 @@ function detectBrandImpersonation(hostname) {
     { name: 'facebook', official: ['facebook.com'] },
     { name: 'instagram', official: ['instagram.com'] },
     { name: 'github', official: ['github.com'] },
-    { name: 'chase', official: ['chase.com'] }
+    { name: 'chase', official: ['chase.com'] },
+    { name: 'whatsapp', official: ['whatsapp.com'] },
+    { name: 'linkedin', official: ['linkedin.com'] },
+    { name: 'bankofamerica', official: ['bankofamerica.com', 'bofa.com'] },
+    { name: 'gmail', official: ['gmail.com'] },
+    { name: 'outlook', official: ['outlook.com'] }
   ];
 
   const hostLower = hostname.toLowerCase();
-
-  // Normalize typical leetspeak translations
+  
+  // Normalize typical leetspeak and common phishing substitutions
   const normalized = hostLower
     .replace(/0/g, 'o')
     .replace(/1/g, 'l')
+    .replace(/!/g, 'i')
     .replace(/3/g, 'e')
     .replace(/4/g, 'a')
+    .replace(/@/g, 'a')
     .replace(/5/g, 's')
     .replace(/8/g, 'b')
-    .replace(/vv/g, 'w');
+    .replace(/vv/g, 'w')
+    .replace(/rn/g, 'm')
+    .replace(/q/g, 'g');
 
   for (const brand of brands) {
-    if (hostLower.includes(brand.name) || normalized.includes(brand.name)) {
+    const isDirectMatch = hostLower.includes(brand.name);
+    const isFuzzyMatch = normalized.includes(brand.name);
+    
+    // Check edit distance for typosquatting (e.g., amzaon instead of amazon)
+    // Only check against main domain parts (split by dots or hyphens)
+    const hostParts = hostLower.split(/[\.-]/);
+    let isTyposquat = false;
+    for (const part of hostParts) {
+        if (part.length > 4 && levenshtein(part, brand.name) === 1) {
+            isTyposquat = true;
+            break;
+        }
+    }
+    
+    if (isDirectMatch || isFuzzyMatch || isTyposquat) {
       const isOfficial = brand.official.some(officialDomain => {
         return hostLower === officialDomain || hostLower.endsWith('.' + officialDomain);
       });
+      
       if (!isOfficial) {
-        return { impersonated: true, brand: brand.name };
+        const confidence = (isFuzzyMatch && !isDirectMatch) || isTyposquat ? 'high' : 'medium';
+        console.log(`[SentinelX] Brand impersonation detected: ${hostLower} → ${brand.name} (Confidence: ${confidence})`);
+        return { impersonated: true, brand: brand.name, confidence };
       }
     }
   }
@@ -377,10 +431,9 @@ function analyseUrl(url) {
   const matchedKeywords = suspiciousKeywords.filter(kw => lowerHref.includes(kw));
 
   if (matchedKeywords.length > 0) {
-    const penalty = Math.min(matchedKeywords.length * 10, 25);
-    score += penalty;
+    score += 20;
     checks.push({
-      label: `Suspicious keywords: ${matchedKeywords.slice(0, 3).join(', ')}`,
+      label: `Suspicious security/login keywords detected: ${matchedKeywords.slice(0, 3).join(', ')}`,
       passed: false
     });
   } else {
@@ -418,7 +471,7 @@ function analyseUrl(url) {
   const suspiciousTLDs = ['.tk', '.ml', '.ga', '.cf', '.gq', '.xyz', '.top', '.click', '.loan', '.link', '.zip', '.mov'];
   const hasSuspiciousTLD = suspiciousTLDs.some(tld => hostname.endsWith(tld));
   if (hasSuspiciousTLD) {
-    score += 15;
+    score += 25;
     checks.push({ label: 'High-risk TLD detected', passed: false });
   } else {
     checks.push({ label: 'Standard TLD', passed: true });
@@ -444,11 +497,28 @@ function analyseUrl(url) {
 
   // ── 9. Suspicious Brand Impersonation Check ──
   const brandImpersonation = detectBrandImpersonation(hostname);
-  if (brandImpersonation.impersonated) {
-    score += 30;
-    checks.push({ label: `Brand impersonation: resembles official ${brandImpersonation.brand} domain`, passed: false });
+  const hasBrandImpersonation = brandImpersonation.impersonated;
+  if (hasBrandImpersonation) {
+    score += 40;
+    const confidenceMarker = brandImpersonation.confidence === 'high' ? ' (High Confidence)' : '';
+    checks.push({ label: `Brand impersonation${confidenceMarker}: domain mimics ${brandImpersonation.brand}`, passed: false });
   } else {
     checks.push({ label: 'No brand impersonation detected', passed: true });
+  }
+
+  // ── 9b. Context-Aware Threat Escalation ──
+  // If multiple strong signals combine, dramatically increase the score.
+  if (hasBrandImpersonation && matchedKeywords.length > 0) {
+    console.log(`[SentinelX] Phishing escalation triggered: brand + keyword`);
+    score += 30;
+    checks.push({ label: 'Critical Escalation: Brand spoofing combined with security keywords', passed: false });
+  }
+  
+  if (hasBrandImpersonation && hasSuspiciousTLD) {
+    console.log(`[SentinelX] Phishing escalation triggered: brand + risky TLD`);
+    score += 25;
+    checks.push({ label: 'Critical Escalation: Brand spoofing hosted on high-risk TLD', passed: false });
+  }
   }
 
   // ── 10. Suspicious Characters/Encoding Check ──
@@ -457,7 +527,7 @@ function analyseUrl(url) {
   const containsBackslash = pathname.includes('\\');
 
   if (encodedSymbols > 3 || containsAtSymbol || containsBackslash) {
-    score += 15;
+    score += 10;
     let reason = 'Suspicious URL encoding / symbols';
     if (containsAtSymbol) reason += ' (@ credentials)';
     if (containsBackslash) reason += ' (backslash obfuscation)';
@@ -475,10 +545,11 @@ function analyseUrl(url) {
  * Assembles the final result object with a human-readable label.
  */
 function buildResult(url, score, checks, isHttps = true) {
-  // Unified risk thresholds: 0-20 Safe | 21-50 Moderate Risk | 51-100 Dangerous
+  // Unified risk thresholds: 0-5 Safe | 6-20 Low Risk | 21-45 Moderate Risk | 46-100 Dangerous
   let label;
-  if (score <= 20)      label = 'Safe';
-  else if (score <= 50) label = 'Moderate Risk';
+  if (score <= 5)       label = 'Safe';
+  else if (score <= 20) label = 'Low Risk';
+  else if (score <= 45) label = 'Moderate Risk';
   else                  label = 'Dangerous';
 
   // Structured debug log — visible in the background service worker console
