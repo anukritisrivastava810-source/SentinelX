@@ -64,7 +64,16 @@ async function initPopup() {
     }
 
     renderUrlSection(tab.url);
-
+    // Show loading indicator while cloud lookup may be in progress
+    const { cloudLoading } = await chrome.storage.session.get('cloudLoading');
+    if (cloudLoading) {
+      const statusPill = document.getElementById('statusPill');
+      const statusText = document.getElementById('statusText');
+      if (statusPill && statusText) {
+        statusPill.className = 'status-pill loading';
+        statusText.textContent = 'Fetching cloud reputation...';
+      }
+    }
     chrome.runtime.sendMessage({ type: 'ANALYSE_URL', url: tab.url }, (response) => {
       if (chrome.runtime.lastError) {
         console.error('[SentinelX Popup] Message error:', chrome.runtime.lastError);

@@ -30,7 +30,10 @@
  * ═══════════════════════════════════════════════════════
  */
 
-'use strict';
+import { lookupUrls } from '../src/services/safeBrowsingService.js';
+import { getCache, setCache } from '../src/utils/cache.js';
+import { aggregate } from '../src/services/aggregationEngine.js';
+import { LOG } from '../src/utils/logger.js';
 
 // ───────────────────────────────────────────────────────
 // 1. INSTALL / STARTUP EVENTS
@@ -155,47 +158,75 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // ───────────────────────────────────────────────────────
 
 /**
- * handleAnalyseRequest(url)
- * Called by popup.js when opening the popup.
+ * Performs a full analysis combining local heuristics and Safe Browsing.
+ * It first runs the existing local `analyseUrl`, then checks the cache for a
+ * Safe Browsing result. If missing, it queries the Safe Browsing service,
+ * stores the result in the cache, and finally merges both using the
+ * aggregation engine.
+ *
+ * @param {string} url – the URL to analyse
+ * @returns {Promise<Object>} – the merged result object ready for storage.
+ */
+async function performFullAnalysis(url) {
+  // 1️⃣ Local analysis (unchanged from previous implementation)
+  const localResult = analyseUrl(url);
+
+  // 2️⃣ Cloud reputation – check cache first
+  let cloudResult = await getCache(url);
+  if (!cloudResult) {
+    try {
+      // Indicate loading state for popup UI
+      await chrome.storage.session.set({ cloudLoading: true });
+      const cloudResponses = await lookupUrls([url]);
+      cloudResult = cloudResponses[0] || { url, threatTypes: [], cacheDurationMs: null };
+      // Cache the result (respect any TTL supplied by the API)
+      await setCache(url, cloudResult, cloudResult.cacheDurationMs);
+    } finally {
+      await chrome.storage.session.set({ cloudLoading: false });
+    }
+  }
+
+  // 3️⃣ Merge local and cloud data
+  const merged = aggregate(localResult, cloudResult);
+  return merged;
+}
+
+/**
+ * Updated request handler – now uses the full analysis flow.
  */
 async function handleAnalyseRequest(url) {
   const cached = await getCachedResult(url);
   if (cached) {
-    console.log('[SentinelX BG] Returning cached result for:', url);
-    return cached;
+    LOG.info('[SentinelX BG] Returning cached local result for:', url);
+    return cached; // This cache only contains the final merged result from prior runs.
   }
-
-  const result = analyseUrl(url);
+  const result = await performFullAnalysis(url);
   await storeResult(url, result);
-
   if (result.score >= 46) {
     await notifyContentScript(result);
   }
-
   return result;
 }
 
 /**
- * analyseAndStore(url, tabId)
- * Performs baseline scans on page update.
+ * Updated background scan for tab activation / navigation.
  */
 async function analyseAndStore(url, tabId) {
   try {
     if (shouldThrottleScan(url)) {
-      console.log('[SentinelX BG] Throttling redundant scan for:', url);
+      LOG.info('[SentinelX BG] Throttling redundant scan for:', url);
       return;
     }
-    const result = analyseUrl(url);
+    const result = await performFullAnalysis(url);
     await storeResult(url, result);
-
-    if (result.score >= 46) {
+    if (result.score >= 46 && tabId) {
       chrome.tabs.sendMessage(tabId, {
         type: 'SHOW_WARNING',
         data: result,
       }).catch(() => {});
     }
   } catch (err) {
-    console.error('[SentinelX BG] analyseAndStore error:', err);
+    LOG.error('[SentinelX BG] analyseAndStore error:', err);
   }
 }
 
