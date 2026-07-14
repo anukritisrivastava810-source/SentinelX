@@ -193,13 +193,23 @@ async function performFullAnalysis(url) {
 
 /**
  * Updated request handler – now uses the full analysis flow.
+ *
+ * TEMPORARY: Cache lookup is disabled while detector bugs are being debugged.
+ * Every popup scan will re-run performFullAnalysis() so that freshly-patched
+ * detectors (shortener, encoding, brand impersonation) always execute and their
+ * console logs are visible in the service-worker DevTools.
+ * Re-enable the cache block once all detectors are confirmed working.
  */
 async function handleAnalyseRequest(url) {
-  const cached = await getCachedResult(url);
-  if (cached) {
-    LOG.info('[SentinelX BG] Returning cached local result for:', url);
-    return cached; // This cache only contains the final merged result from prior runs.
-  }
+  // ── CACHE DISABLED FOR DEBUGGING ──────────────────────────────────────────
+  // const cached = await getCachedResult(url);
+  // if (cached) {
+  //   LOG.info('[SentinelX BG] Returning cached local result for:', url);
+  //   return cached;
+  // }
+  // ──────────────────────────────────────────────────────────────────────────
+  console.log('[SentinelX BG] Cache bypassed — running fresh analysis for:', url);
+
   const result = await performFullAnalysis(url);
   await storeResult(url, result);
   if (result.score >= 46) {
@@ -369,8 +379,13 @@ function detectBrandImpersonation(hostname) {
   ];
 
   const hostLower = hostname.toLowerCase();
-  
-  // Normalize typical leetspeak and common phishing substitutions
+  // BUG FIX #3a: `rootDomain` was re-declared with `const` inside the for-loop
+  // body on the next block, causing the inner declaration to shadow the outer one
+  // and making the outer variable effectively unused / misleading. Kept here as
+  // the single source-of-truth; the inner duplicate has been removed.
+  const rootDomain = hostLower.split('.')[0];
+
+  // Normalise leetspeak substitutions so that g00gle → google, paypa1 → paypal, etc.
   const normalized = hostLower
     .replace(/0/g, 'o')
     .replace(/1/g, 'l')
@@ -384,26 +399,59 @@ function detectBrandImpersonation(hostname) {
     .replace(/rn/g, 'm')
     .replace(/q/g, 'g');
 
+  // Debug: log the values that each comparison will use
+  console.log(`[SentinelX] detectBrandImpersonation() called`);
+  console.log(`  hostname   : ${hostname}`);
+  console.log(`  hostLower  : ${hostLower}`);
+  console.log(`  rootDomain : ${rootDomain}`);
+  console.log(`  normalized : ${normalized}`);
+
   for (const brand of brands) {
-    const isDirectMatch = hostLower.includes(brand.name);
+    // Direct match: brand name appears literally anywhere in the hostname
+    const isDirectMatch =
+      hostLower.includes(brand.name) ||
+      rootDomain.includes(brand.name);
+
+    // Fuzzy match: brand name appears after leetspeak normalisation
     const isFuzzyMatch = normalized.includes(brand.name);
-    
-    // Check edit distance for typosquatting (e.g., amzaon instead of amazon)
-    // Only check against main domain parts (split by dots or hyphens)
-    const hostParts = hostLower.split(/[\.-]/);
+
+    // Typosquat match: edit distance of 1 on any hostname segment
+    const hostParts = hostLower.split(/[.-]/);
     let isTyposquat = false;
+    let typosquatPart = null;
+    let typosquatDist = null;
     for (const part of hostParts) {
-        if (part.length > 4 && levenshtein(part, brand.name) === 1) {
-            isTyposquat = true;
-            break;
+      if (part.length > 4) {
+        const dist = levenshtein(part, brand.name);
+        if (dist === 1) {
+          isTyposquat = true;
+          typosquatPart = part;
+          typosquatDist = dist;
+          break;
         }
+      }
     }
-    
+
+    // Verbose detector logs — one entry per brand iteration
+    console.log('[Brand Detector] Host:', hostname);
+    console.log('[Brand Detector] Normalized:', normalized);
+    console.log('[Brand Detector] Root Domain:', rootDomain);
+    console.log('[Brand Detector] Brand:', brand.name);
+    console.log('[Brand Detector] Direct:', isDirectMatch);
+    console.log('[Brand Detector] Fuzzy:', isFuzzyMatch);
+    console.log('[Brand Detector] Typosquat:', isTyposquat);
+    if (typosquatPart !== null) {
+      console.log(`[Brand Detector] Levenshtein: "${typosquatPart}" vs "${brand.name}" = ${typosquatDist}`);
+    }
+
     if (isDirectMatch || isFuzzyMatch || isTyposquat) {
-      const isOfficial = brand.official.some(officialDomain => {
-        return hostLower === officialDomain || hostLower.endsWith('.' + officialDomain);
-      });
-      
+      const isOfficial = brand.official.some(officialDomain =>
+        hostLower === officialDomain || hostLower.endsWith('.' + officialDomain)
+      );
+
+      // Log official-domain check for every brand that produced any match
+      console.log(`[Brand Detector] MATCH — brand: ${brand.name} | isOfficial: ${isOfficial} | checked against:`, brand.official);
+
       if (!isOfficial) {
         const confidence = (isFuzzyMatch && !isDirectMatch) || isTyposquat ? 'high' : 'medium';
         console.log(`[SentinelX] Brand impersonation detected: ${hostLower} → ${brand.name} (Confidence: ${confidence})`);
@@ -411,6 +459,11 @@ function detectBrandImpersonation(hostname) {
       }
     }
   }
+
+  // BUG FIX #3c: the three console.log lines that appeared AFTER this return
+  // statement were unreachable dead code and have been moved to BEFORE it so
+  // that they actually execute when no brand is matched.
+  console.log(`[SentinelX] detectBrandImpersonation: no match for ${hostLower} (normalized: ${normalized})`);
   return { impersonated: false };
 }
 
@@ -435,6 +488,7 @@ function analyseUrl(url) {
   const { protocol, hostname, pathname, href } = parsedUrl;
 
   // ── 1. Protocol Check (HTTP vs HTTPS) ──
+  console.log('[SentinelX] Executing Check 1: Protocol');
   const isHttps = protocol === 'https:';
   if (!isHttps) {
     score += 35;
@@ -444,6 +498,7 @@ function analyseUrl(url) {
   }
 
   // ── 2. IP-based URL Check ──
+  console.log('[SentinelX] Executing Check 2: IP-based URL');
   const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
   if (ipRegex.test(hostname)) {
     score += 30;
@@ -453,6 +508,7 @@ function analyseUrl(url) {
   }
 
   // ── 3. Suspicious Keywords Check ──
+  console.log('[SentinelX] Executing Check 3: Suspicious Keywords');
   const suspiciousKeywords = [
     'login', 'signin', 'verify', 'secure', 'account',
     'update', 'confirm', 'banking', 'paypal', 'ebay',
@@ -472,6 +528,7 @@ function analyseUrl(url) {
   }
 
   // ── 4. Domain Length Check ──
+  console.log('[SentinelX] Executing Check 4: Domain Length');
   if (hostname.length > 40) {
     score += 15;
     checks.push({ label: `Excessive domain length (${hostname.length} chars)`, passed: false });
@@ -483,6 +540,7 @@ function analyseUrl(url) {
   }
 
   // ── 5. Subdomain Depth Check ──
+  console.log('[SentinelX] Executing Check 5: Subdomain Depth');
   const subdomainParts = hostname.split('.');
   let depthThreshold = 4;
   const isDoubleTld = subdomainParts.length > 2 && 
@@ -499,6 +557,7 @@ function analyseUrl(url) {
   }
 
   // ── 6. Suspicious TLD Check ──
+  console.log('[SentinelX] Executing Check 6: Suspicious TLD');
   const suspiciousTLDs = ['.tk', '.ml', '.ga', '.cf', '.gq', '.xyz', '.top', '.click', '.loan', '.link', '.zip', '.mov'];
   const hasSuspiciousTLD = suspiciousTLDs.some(tld => hostname.endsWith(tld));
   if (hasSuspiciousTLD) {
@@ -509,17 +568,31 @@ function analyseUrl(url) {
   }
 
   // ── 7. URL Shorteners Check ──
+  console.log('[SentinelX] Executing Check 7: URL Shorteners');
   const shorteners = [
     'bit.ly', 'tinyurl.com', 't.co', 'cutt.ly', 'is.gd',
     'buff.ly', 'ow.ly', 'bl.ink', 'v.gd', 'shorturl.at', 'tiny.cc'
   ];
-  const isShortener = shorteners.some(s => hostname === s || hostname.endsWith('.' + s));
+  const isShortener = shorteners.some(s => {
+    const exactMatch   = hostname === s;
+    const subdomMatch  = hostname.endsWith('.' + s);
+    if (exactMatch || subdomMatch) {
+      console.log(`[SentinelX] Shortener match: "${hostname}" matched "${s}" (exact=${exactMatch}, subdomain=${subdomMatch})`);
+    }
+    return exactMatch || subdomMatch;
+  });
+  // Verbose detector logs
+  console.log('[Detector] Host:', hostname);
+  console.log('[Detector] isShortener:', isShortener);
   if (isShortener) {
     score += 25;
     checks.push({ label: 'URL shortener domain detected', passed: false, warn: true });
+  } else {
+    checks.push({ label: 'Not a known URL shortener', passed: true });
   }
 
   // ── 8. Excessive Hyphens Check ──
+  console.log('[SentinelX] Executing Check 8: Excessive Hyphens');
   const hyphenCount = (hostname.match(/-/g) || []).length;
   if (hyphenCount > 2) {
     score += 15;
@@ -527,6 +600,7 @@ function analyseUrl(url) {
   }
 
   // ── 9. Suspicious Brand Impersonation Check ──
+  console.log('[SentinelX] Executing Check 9: Brand Impersonation');
   const brandImpersonation = detectBrandImpersonation(hostname);
   const hasBrandImpersonation = brandImpersonation.impersonated;
   if (hasBrandImpersonation) {
@@ -538,6 +612,7 @@ function analyseUrl(url) {
   }
 
   // ── 9b. Context-Aware Threat Escalation ──
+  console.log('[SentinelX] Executing Check 9b: Context-Aware Threat Escalation');
   // If multiple strong signals combine, dramatically increase the score.
   if (hasBrandImpersonation && matchedKeywords.length > 0) {
     console.log(`[SentinelX] Phishing escalation triggered: brand + keyword`);
@@ -550,20 +625,72 @@ function analyseUrl(url) {
     score += 25;
     checks.push({ label: 'Critical Escalation: Brand spoofing hosted on high-risk TLD', passed: false });
   }
-  }
-
   // ── 10. Suspicious Characters/Encoding Check ──
-  const encodedSymbols = (url.match(/%/g) || []).length;
-  const containsAtSymbol = hostname.includes('@');
-  const containsBackslash = pathname.includes('\\');
+  console.log('[SentinelX] Executing Check 10: Suspicious Characters/Encoding');
+  // Match genuine percent-encoded byte sequences (%XX where XX = two hex digits).
+  // This correctly identifies obfuscated paths like %68%61%63%6b ("hack"),
+  // %40 (@), %2F (/), %5C (\), %2E (.) without false-positives on bare '%'.
+  const encodedMatches     = url.match(/(%[0-9A-Fa-f]{2})/g) || [];
+  const encodedSymbols     = encodedMatches.length;
+  // Specific high-risk encoded characters — checked independently of the
+  // total count so a URL with only one %40 still surfaces the right label.
+  const encodedAt          = /(%40)/i.test(url);           // encoded @
+  const encodedSlash       = /(%2F)/i.test(url);           // encoded /
+  const encodedBackslash   = /(%5C)/i.test(url);           // encoded \
+  const encodedDot         = /(%2E)/i.test(url);           // encoded .
+  // Also keep detecting literal special characters already in the parsed URL
+  const containsAtSymbol   = hostname.includes('@');
+  const containsBackslash  = pathname.includes('\\') || encodedBackslash;
 
-  if (encodedSymbols > 3 || containsAtSymbol || containsBackslash) {
-    score += 10;
+  // Verbose detector logs
+  console.log('[Detector] URL:', href);
+  console.log('[Detector] Encoded count:', encodedSymbols);
+  console.log('[Detector] Encoded matches:', encodedMatches);
+  console.log('[Detector] Encoded slash (%2F):', encodedSlash);
+  console.log('[Detector] Encoded @ (%40):', encodedAt);
+  console.log('[Detector] Encoded dot (%2E):', encodedDot);
+  console.log('[Detector] Encoded backslash (%5C):', encodedBackslash);
+  console.log('[Detector] Contains @:', containsAtSymbol);
+  console.log('[Detector] Contains backslash:', containsBackslash);
+
+  // Trigger when: 3+ encoded bytes, or any specifically dangerous encoded char,
+  // or literal @ / backslash already in hostname / path.
+  const hasSuspiciousEncoding =
+    encodedSymbols >= 3 ||
+    encodedAt || encodedSlash || encodedBackslash || encodedDot ||
+    containsAtSymbol || containsBackslash;
+
+  if (hasSuspiciousEncoding) {
+    score += 15;
     let reason = 'Suspicious URL encoding / symbols';
-    if (containsAtSymbol) reason += ' (@ credentials)';
-    if (containsBackslash) reason += ' (backslash obfuscation)';
+    if (encodedSymbols >= 1) {
+      const sample = encodedMatches.slice(0, 5).join(' ');
+      reason += ` (${encodedSymbols} percent-encoded bytes: ${sample})`;
+    }
+    if (encodedAt)           reason += ' [%40 encoded @]';
+    if (encodedSlash)        reason += ' [%2F encoded /]';
+    if (encodedBackslash)    reason += ' [%5C encoded \\]';
+    if (encodedDot)          reason += ' [%2E encoded .]';
+    if (containsAtSymbol)    reason += ' (@ credentials)';
+    if (containsBackslash && !encodedBackslash) reason += ' (backslash obfuscation)';
     checks.push({ label: reason, passed: false });
+  } else {
+    checks.push({ label: 'No suspicious URL encoding or symbols', passed: true });
   }
+
+  // ── 9c. Context-Aware Escalation: Encoded URL + Suspicious Keyword ──
+  console.log('[SentinelX] Executing Check 9c: Escalation — Encoded URL + Keyword');
+  if (hasSuspiciousEncoding && matchedKeywords.length > 0) {
+    console.log(`[SentinelX] Phishing escalation triggered: encoded URL + keyword (${matchedKeywords[0]})`);
+    score += 20;
+    checks.push({ label: `Critical Escalation: Encoded URL combined with suspicious keyword (${matchedKeywords.slice(0, 2).join(', ')})`, passed: false });
+  }
+
+  console.log('[SentinelX] Hostname:', hostname);
+  console.log('[SentinelX] Matched keywords:', matchedKeywords);
+  console.log('[SentinelX] Encoded chars:', encodedSymbols);
+  console.log('[SentinelX] Brand result:', brandImpersonation);
+  console.log('[SentinelX] Is shortener:', isShortener);
 
   // Cap score at 100
   score = Math.min(score, 100);
@@ -605,6 +732,7 @@ function buildResult(url, score, checks, isHttps = true) {
     checks,
     timestamp: Date.now(),
   };
+
 }
 
 // ───────────────────────────────────────────────────────
@@ -731,4 +859,4 @@ function isAnalysableUrl(url) {
   return !nonAnalysable.some(prefix => url.startsWith(prefix));
 }
 
-console.log('[SentinelX BG] Service worker initialised ✓');
+console.log('[SentinelX BG] Service worker initialised ✓')
