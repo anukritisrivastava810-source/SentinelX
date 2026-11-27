@@ -1,4 +1,4 @@
-# 🛡️ SentinelX — Phase 1: Extension Foundation
+# 🛡️ SentinelX — Phase 3: Browser Security Assistant
 
 > AI-powered browser security extension · Chrome · Manifest V3
 
@@ -16,7 +16,10 @@ sentinelx/
 ├── background/
 │   └── background.js      ← Service worker (URL analysis, storage)
 ├── content/
-│   └── content.js         ← DOM injection (warning banners)
+│   ├── content.js         ← DOM findings + warning banners
+│   └── permissionBridge.js ← Page-world permission request observer
+├── options/               ← Persistent monitoring settings page
+└── src/modules/           ← Download, redirect, permission, report, analytics, and settings modules
 └── assets/
     ├── icon16.png
     ├── icon32.png
@@ -128,6 +131,36 @@ Data is stored in `chrome.storage.local` with these keys:
   "sentinelx_version": "1.0.0",
   "sentinelx_scan_count": 42,
   "sentinelx_last_scan": 1714000000000,   // Unix timestamp
+  "sentinelx_settings": {
+    "automaticScanning": true,
+    "downloadMonitoring": true,
+    "redirectMonitoring": true,
+    "permissionMonitoring": true,
+    "warningSensitivity": "balanced"
+  },
+
+  // Phase 3A unified monitoring document:
+  "dashboard": {
+    "downloads": [
+      { id, url, referrer, filename, extension, mime, danger, risky, state, timestamp }
+    ],
+    "redirects": [
+      { original, final, count, highRedirect, timestamp }
+    ],
+    "permissions": [
+      { permission, url, timestamp }
+    ],
+    "history": [
+      { timestamp, eventType, url, score, label, filename, redirectCount, permission }
+    ],
+    "statistics": {
+      "totalScans": 42,
+      "dangerousSites": 2,
+      "downloads": 5,
+      "redirects": 3
+    },
+    "reports": []
+  },
 
   // Per-URL scan results (keyed by encoded URL):
   "sentinelx_scan:https%3A%2F%2Fexample.com": {
@@ -162,14 +195,13 @@ To inspect storage in DevTools:
 
 ---
 
-## 🔮 What's Coming in Phase 2
+## Phase 3 manual testing
 
-- AI-powered risk analysis (Gemini/GPT API integration)
-- Real-time phishing database lookup
-- Threat intelligence feeds
-- User dashboard with scan history
-- Domain reputation scoring
+1. Reload the unpacked extension on `chrome://extensions` after accepting the new Downloads and webNavigation permissions.
+2. Visit a website, open the popup, and confirm Website Summary and Local Statistics render. Use the search/filter/clear controls under Recent Scans.
+3. Download a harmless test file with one of the monitored extensions (for example a locally hosted `.ps1`). It remains downloadable; inspect the popup after returning to the source page or extension storage for `dashboard.downloads` (under the `dashboard` key).
+4. Navigate through a redirect test page such as `https://httpbin.org/redirect/4`; verify a redirect record in extension storage under `dashboard.redirects` and the elevated result when scanning the final URL.
+5. On a test page that calls `Notification.requestPermission()`, `navigator.geolocation.getCurrentPosition()`, or `getUserMedia()`, grant or dismiss the browser prompt. The permission request appears in extension storage under `dashboard.permissions` (under the `dashboard` key).
+6. Open the popup Settings link, toggle monitors, reload a page, and verify the selection persists. Use Clear SentinelX storage to remove all SentinelX activity while retaining preferences.
 
----
-
-*SentinelX Phase 1 — Built with Chrome Extension Manifest V3*
+All Phase 3 records stay in `chrome.storage.local`; no backend or setup is required.

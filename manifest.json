@@ -8,7 +8,8 @@
     "activeTab",
     "tabs",
     "storage",
-    "scripting"
+    "downloads",
+    "webNavigation"
   ],
 
   "host_permissions": [
@@ -26,6 +27,8 @@
     }
   },
 
+  "options_page": "options/options.html",
+
   "background": {
     "service_worker": "background/background.js",
     "type": "module"
@@ -34,8 +37,14 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
+      "js": ["content/permissionBridge.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["<all_urls>"],
       "js": ["content/content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ],
 

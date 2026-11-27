@@ -22,42 +22,59 @@ function cloudThreatScore(threatTypes) {
  * extended `checks` array that contains a synthetic "Safe Browsing"
  * entry.
  *
+ * If the cloud lookup was skipped or unavailable (e.g. unconfigured API key or network failure),
+ * localResult.score is used at 100% weight without dilution.
+ *
  * @param {Object} localResult – output of analyseUrl()
- * @param {Object} cloudResult – { url, threatTypes, cacheDurationMs }
+ * @param {Object} cloudResult – { url, threatTypes, cacheDurationMs, skipped, cloudAvailable }
  * @returns {Object} merged result ready for storage/UI.
  */
 export function aggregate(localResult, cloudResult) {
-  const cloudScore = cloudThreatScore(cloudResult.threatTypes);
-  const weightedScore = Math.round(
-    localResult.score * AGGREGATION_WEIGHT.LOCAL +
-    cloudScore * AGGREGATION_WEIGHT.CLOUD,
-  );
+  const isCloudAvailable = Boolean(cloudResult && !cloudResult.skipped && cloudResult.cloudAvailable !== false);
 
-  // If any cloud threat is present, we force Dangerous regardless of numeric score.
-  const finalScore = cloudResult.threatTypes.length > 0 ? Math.max(weightedScore, 70) : weightedScore;
+  let finalScore;
+  let finalLabel;
+  const mergedChecks = [...localResult.checks];
+
+  if (!isCloudAvailable) {
+    // Cloud lookup was skipped/unavailable – use 100% local score directly without dilution
+    finalScore = localResult.score;
+    mergedChecks.push({
+      label: 'Safe Browsing: skipped (API key not configured or service unavailable)',
+      passed: true,
+      isCloud: true,
+      skipped: true,
+    });
+  } else {
+    const cloudScore = cloudThreatScore(cloudResult.threatTypes);
+    const weightedScore = Math.round(
+      localResult.score * AGGREGATION_WEIGHT.LOCAL +
+      cloudScore * AGGREGATION_WEIGHT.CLOUD,
+    );
+
+    // If any cloud threat is present, we force Dangerous regardless of numeric score.
+    finalScore = cloudResult.threatTypes.length > 0 ? Math.max(weightedScore, 70) : weightedScore;
+
+    if (cloudResult.threatTypes.length > 0) {
+      mergedChecks.push({
+        label: `Safe Browsing: ${cloudResult.threatTypes.join(', ')}`,
+        passed: false,
+        isCloud: true,
+      });
+    } else {
+      mergedChecks.push({
+        label: 'Safe Browsing: no threats detected',
+        passed: true,
+        isCloud: true,
+      });
+    }
+  }
 
   // Determine label using unified thresholds.
-  let finalLabel;
   if (finalScore <= RISK_THRESHOLDS.SAFE) finalLabel = 'Safe';
   else if (finalScore <= RISK_THRESHOLDS.LOW) finalLabel = 'Low Risk';
   else if (finalScore <= RISK_THRESHOLDS.MODERATE) finalLabel = 'Moderate Risk';
   else finalLabel = 'Dangerous';
-
-  // Clone checks and add cloud entry.
-  const mergedChecks = [...localResult.checks];
-  if (cloudResult.threatTypes.length > 0) {
-    mergedChecks.push({
-      label: `Safe Browsing: ${cloudResult.threatTypes.join(', ')}`,
-      passed: false,
-      isCloud: true,
-    });
-  } else {
-    mergedChecks.push({
-      label: 'Safe Browsing: no threats detected',
-      passed: true,
-      isCloud: true,
-    });
-  }
 
   LOG.info('Aggregation completed – finalScore', finalScore, 'label', finalLabel);
 
@@ -67,8 +84,10 @@ export function aggregate(localResult, cloudResult) {
     label: finalLabel,
     checks: mergedChecks,
     cloud: {
-      threatTypes: cloudResult.threatTypes,
-      cacheExpires: cloudResult.cacheDurationMs,
+      threatTypes: cloudResult?.threatTypes || [],
+      cacheExpires: cloudResult?.cacheDurationMs || null,
+      cloudAvailable: isCloudAvailable,
+      skipped: !isCloudAvailable,
     },
   };
 }

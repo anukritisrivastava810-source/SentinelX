@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SentinelX Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <h1>Sentinel<span>X</span> Settings</h1>
+    <p>Choose how SentinelX monitors browser activity. Monitoring only records local security context and never blocks browser actions.</p>
+
+    <section>
+      <h2>Protection</h2>
+      <label><input type="checkbox" data-setting="automaticScanning"> Automatic scanning</label>
+      <label><input type="checkbox" data-setting="downloadMonitoring"> Download monitoring</label>
+      <label><input type="checkbox" data-setting="redirectMonitoring"> Redirect monitoring</label>
+      <label><input type="checkbox" data-setting="permissionMonitoring"> Permission monitoring</label>
+      <label>Warning sensitivity
+        <select data-setting="warningSensitivity">
+          <option value="low">Low (Score &ge; 70)</option>
+          <option value="balanced">Balanced (Score &ge; 46)</option>
+          <option value="high">High (Score &ge; 21)</option>
+        </select>
+      </label>
+    </section>
+
+    <section id="reportsSection">
+      <div class="section-header">
+        <h2>Security Reports</h2>
+        <div class="reports-actions">
+          <button id="exportJson" type="button" class="action-btn">Export JSON</button>
+          <button id="exportCsv" type="button" class="action-btn">Export CSV</button>
+        </div>
+      </div>
+      <p class="section-desc">Audit reports recorded during URL scans, including domain reputation, redirect hops, permission requests, and observed downloads.</p>
+      <div class="table-container">
+        <table class="reports-table" id="reportsTable" style="display: none;">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>URL</th>
+              <th>Verdict</th>
+              <th>HTTPS</th>
+              <th>Redirects</th>
+              <th>Permissions</th>
+              <th>Downloads</th>
+            </tr>
+          </thead>
+          <tbody id="reportsTableBody"></tbody>
+        </table>
+        <div id="reportsEmpty" class="reports-empty">No security reports recorded yet.</div>
+      </div>
+    </section>
+
+    <section id="whitelistSection">
+      <div class="section-header">
+        <h2>Trusted Sites (Whitelist)</h2>
+      </div>
+      <p class="section-desc">Domains you have trusted. Active warning banners will not be displayed on these sites, though scan scores remain visible in the popup.</p>
+      <div id="whitelistContainer" class="whitelist-container">
+        <ul id="whitelistList" class="whitelist-list" style="display: none;"></ul>
+        <div id="whitelistEmpty" class="whitelist-empty">No trusted sites added yet. You can trust sites directly from the in-page warning banner.</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Data</h2>
+      <p>Clear SentinelX scan, monitoring, report, and analytics data stored in this browser.</p>
+      <button id="clearStorage" class="danger">Clear SentinelX storage</button>
+      <span id="status" role="status"></span>
+    </section>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

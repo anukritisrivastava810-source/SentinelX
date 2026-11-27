@@ -27,24 +27,43 @@ if (window.__sentinelx_loaded) {
 function initContentScript() {
   console.log('[SentinelX Content] Loaded on:', window.location.href);
 
-  // 1. Scan page DOM and report findings to background.js
-  reportPageInfo();
+  // Listen for permission requests dispatched from the main-world bridge
+  window.addEventListener('sentinelx-permission-request', (event) => {
+    chrome.runtime.sendMessage({
+      type: 'PERMISSION_REQUEST',
+      data: { ...event.detail, url: window.location.href }
+    }).catch(() => {});
+  });
+
+  // 1. Scan page DOM and report findings to background.js (wait for DOM if at document_start)
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => reportPageInfo(), { once: true });
+  } else {
+    reportPageInfo();
+  }
 
   // 2. Listen for security notifications from background.js
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log('[SentinelX Content] Message received:', message.type);
-
     switch (message.type) {
       case 'SHOW_WARNING': {
+        console.log('[SentinelX Content] Message received: SHOW_WARNING');
         showWarningBanner(message.data);
         sendResponse({ shown: true });
         break;
       }
       case 'HIDE_WARNING': {
+        console.log('[SentinelX Content] Message received: HIDE_WARNING');
         removeWarningBanner();
         sendResponse({ hidden: true });
         break;
       }
+      case 'GET_DASHBOARD':
+      case 'ANALYSE_URL':
+      case 'PERMISSION_REQUEST':
+      case 'PAGE_INFO':
+      case 'WHITELIST_DOMAIN':
+        // Background/popup-only message types — ignore silently in content script
+        break;
       default:
         console.warn('[SentinelX Content] Unknown message type:', message.type);
     }
@@ -83,7 +102,11 @@ function scanForms() {
       }
     }
   });
-  return { insecureAction, actionDomainMismatch };
+  return { insecureAction, actionDomainMismatch, externalFormActions: Array.from(forms).filter(form => {
+    const action = form.getAttribute('action');
+    if (!action) return false;
+    try { return new URL(action, window.location.href).origin !== window.location.origin; } catch { return false; }
+  }).length };
 }
 
 /**
@@ -116,13 +139,19 @@ function reportPageInfo() {
     title:     document.title,
     isHttps:   window.location.protocol === 'https:',
     hasPasswordInput: document.querySelector('input[type="password"]') !== null,
+    passwordFieldCount: document.querySelectorAll('input[type="password"]').length,
     formCount: document.querySelectorAll('form').length,
+    loginFormCount: Array.from(document.querySelectorAll('form')).filter(form => form.querySelector('input[type="password"], input[type="email"], input[name*="user" i]')).length,
+    hiddenInputCount: document.querySelectorAll('input[type="hidden"]').length,
+    iframeCount: document.querySelectorAll('iframe').length,
+    externalScriptCount: Array.from(document.scripts).filter(script => script.src && new URL(script.src, window.location.href).origin !== window.location.origin).length,
     linkCount:  document.querySelectorAll('a[href]').length,
     loadTime:   performance.now().toFixed(0) + 'ms',
     
     // Content-based threat features
     insecureAction: formScan.insecureAction,
     actionDomainMismatch: formScan.actionDomainMismatch,
+    externalFormActions: formScan.externalFormActions,
     hasExcessiveHiddenInputs: document.querySelectorAll('input[type="hidden"]').length > 15,
     hasSuspiciousButtons: scanSuspiciousButtons()
   };
@@ -199,7 +228,15 @@ function showWarningBanner(result) {
   icon.style.lineHeight = '1';
 
   const textNode = document.createElement('span');
-  textNode.innerHTML = `<strong>SentinelX:</strong> ${style.message} &nbsp;<span style="font-size: 11px; font-weight: 500; opacity: 0.85;">(Risk: ${score}/100)</span>`;
+  const strongTag = document.createElement('strong');
+  strongTag.textContent = 'SentinelX: ';
+  const messageText = document.createTextNode((style.message || 'Warning') + ' ');
+  const scoreSpan = document.createElement('span');
+  scoreSpan.style.cssText = 'font-size: 11px; font-weight: 500; opacity: 0.85;';
+  scoreSpan.textContent = `(Risk: ${score}/100)`;
+  textNode.appendChild(strongTag);
+  textNode.appendChild(messageText);
+  textNode.appendChild(scoreSpan);
 
   left.appendChild(icon);
   left.appendChild(textNode);
@@ -228,6 +265,37 @@ function showWarningBanner(result) {
     outline: 'none'
   });
 
+  // Trust This Site Button
+  const trustBtn = document.createElement('button');
+  trustBtn.textContent = 'Trust This Site';
+  Object.assign(trustBtn.style, {
+    background: 'rgba(0, 0, 0, 0.05)',
+    border: '1px solid rgba(0, 0, 0, 0.1)',
+    borderRadius: '4px',
+    color: style.textColor,
+    fontFamily: 'inherit',
+    fontSize: '11px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    padding: '4px 10px',
+    transition: 'background 0.2s',
+    outline: 'none'
+  });
+
+  trustBtn.addEventListener('mouseenter', () => {
+    trustBtn.style.background = 'rgba(0, 0, 0, 0.1)';
+  });
+  trustBtn.addEventListener('mouseleave', () => {
+    trustBtn.style.background = 'rgba(0, 0, 0, 0.05)';
+  });
+  trustBtn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({
+      type: 'WHITELIST_DOMAIN',
+      hostname: window.location.hostname
+    }).catch(() => {});
+    removeWarningBanner();
+  });
+
   // Dismiss Button
   const closeBtn = document.createElement('button');
   closeBtn.textContent = 'Dismiss';
@@ -253,6 +321,7 @@ function showWarningBanner(result) {
   });
 
   right.appendChild(toggleBtn);
+  right.appendChild(trustBtn);
   right.appendChild(closeBtn);
   header.appendChild(left);
   header.appendChild(right);

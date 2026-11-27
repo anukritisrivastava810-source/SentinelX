@@ -34,6 +34,12 @@ import { lookupUrls } from '../src/services/safeBrowsingService.js';
 import { getCache, setCache } from '../src/utils/cache.js';
 import { aggregate } from '../src/services/aggregationEngine.js';
 import { LOG } from '../src/utils/logger.js';
+import { initialiseSettings, getSettings, isDomainWhitelisted, addWhitelistedDomain } from '../src/modules/settings.js';
+import { initialiseDownloadMonitor } from '../src/modules/downloadMonitor.js';
+import { initialiseRedirectMonitor } from '../src/modules/redirectMonitor.js';
+import { recordPermissionRequest } from '../src/modules/permissionMonitor.js';
+import { createSecurityReport } from '../src/modules/reports.js';
+import { appendDashboardHistory, getDashboard, updateDashboard, DEFAULT_DASHBOARD } from '../src/modules/dashboard.js';
 
 // ───────────────────────────────────────────────────────
 // 1. INSTALL / STARTUP EVENTS
@@ -46,15 +52,17 @@ import { LOG } from '../src/utils/logger.js';
  *   - Chrome is updated
  * Good place to set default storage values.
  */
-chrome.runtime.onInstalled.addListener((details) => {
+chrome.runtime.onInstalled.addListener(async (details) => {
   console.log('[SentinelX BG] Extension installed/updated:', details.reason);
 
   // Initialise storage with default values
-  chrome.storage.local.set({
+  const existing = await chrome.storage.local.get(['sentinelx_version', 'sentinelx_scan_count', 'sentinelx_last_scan']);
+  await chrome.storage.local.set({
     sentinelx_version: '1.0.0',
-    sentinelx_scan_count: 0,
-    sentinelx_last_scan: null,
+    sentinelx_scan_count: existing.sentinelx_scan_count ?? 0,
+    sentinelx_last_scan: existing.sentinelx_last_scan ?? null,
   });
+  await initialiseSettings();
 });
 
 /**
@@ -63,6 +71,9 @@ chrome.runtime.onInstalled.addListener((details) => {
 chrome.runtime.onStartup.addListener(() => {
   console.log('[SentinelX BG] Browser started. Extension ready.');
 });
+
+initialiseDownloadMonitor();
+initialiseRedirectMonitor();
 
 // ───────────────────────────────────────────────────────
 // 2. DEBOUNCE TRACKER & TAB MONITORING
@@ -99,6 +110,7 @@ function shouldThrottleScan(url) {
  */
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
+    if (!(await getSettings()).automaticScanning) return;
     const tab = await chrome.tabs.get(activeInfo.tabId);
     if (tab.url && isAnalysableUrl(tab.url)) {
       console.log('[SentinelX BG] Tab activated:', tab.url);
@@ -113,7 +125,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
  * onUpdated fires when a tab finishes navigation.
  */
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'complete' && tab.url && isAnalysableUrl(tab.url)) {
+  if ((await getSettings()).automaticScanning && changeInfo.status === 'complete' && tab.url && isAnalysableUrl(tab.url)) {
     console.log('[SentinelX BG] Tab updated:', tab.url);
     await analyseAndStore(tab.url, tabId);
   }
@@ -124,6 +136,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 // ───────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id) {
+    console.warn('[SentinelX BG] Rejected unauthorized message from sender:', sender?.id);
+    return;
+  }
+
   console.log('[SentinelX BG] Message received:', message.type, 'from:', sender.tab?.url ?? 'popup');
 
   switch (message.type) {
@@ -144,6 +161,62 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch((err) => {
           console.error('[SentinelX BG] handlePageInfo error:', err);
           sendResponse({ error: err.message });
+        });
+      return true;
+    }
+
+    case 'PERMISSION_REQUEST': {
+      recordPermissionRequest(message.data)
+        .then((entry) => sendResponse({ received: Boolean(entry) }))
+        .catch((err) => sendResponse({ error: err.message }));
+      return true;
+    }
+
+    case 'GET_DASHBOARD': {
+      getDashboardData(message?.url)
+        .then((dashboard) => sendResponse({ ok: true, dashboard }))
+        .catch(async (err) => {
+          console.error('[SentinelX BG] getDashboardData error:', err);
+          const fallback = await getDashboard().catch(() => ({ ...DEFAULT_DASHBOARD }));
+          sendResponse({
+            ok: true,
+            dashboard: {
+              ...fallback,
+              statistics: {
+                ...DEFAULT_DASHBOARD.statistics,
+                ...(fallback?.statistics || {})
+              },
+              siteSummary: {
+                host: '',
+                downloadCount: 0,
+                redirectCount: 0,
+                permissionCount: 0,
+                downloads: [],
+                redirects: [],
+                permissions: []
+              }
+            }
+          });
+        });
+      return true;
+    }
+
+    case 'WHITELIST_DOMAIN': {
+      const hostname = message.hostname;
+      if (!hostname) {
+        sendResponse({ ok: false, error: 'Missing hostname' });
+        return false;
+      }
+      addWhitelistedDomain(hostname)
+        .then(async (updatedList) => {
+          if (sender.tab?.id) {
+            await chrome.tabs.sendMessage(sender.tab.id, { type: 'HIDE_WARNING' }).catch(() => {});
+          }
+          sendResponse({ ok: true, whitelistedDomains: updatedList });
+        })
+        .catch((err) => {
+          console.error('[SentinelX BG] WHITELIST_DOMAIN error:', err);
+          sendResponse({ ok: false, error: err.message });
         });
       return true;
     }
@@ -178,17 +251,18 @@ async function performFullAnalysis(url) {
       // Indicate loading state for popup UI
       await chrome.storage.session.set({ cloudLoading: true });
       const cloudResponses = await lookupUrls([url]);
-      cloudResult = cloudResponses[0] || { url, threatTypes: [], cacheDurationMs: null };
-      // Cache the result (respect any TTL supplied by the API)
-      await setCache(url, cloudResult, cloudResult.cacheDurationMs);
+      cloudResult = cloudResponses[0] || { url, threatTypes: [], cacheDurationMs: null, skipped: true, cloudAvailable: false };
+      // Cache the result only if a valid cloud lookup was completed (do not cache skipped/unavailable results)
+      if (cloudResult && !cloudResult.skipped && cloudResult.cloudAvailable !== false) {
+        await setCache(url, cloudResult, cloudResult.cacheDurationMs);
+      }
     } finally {
       await chrome.storage.session.set({ cloudLoading: false });
     }
   }
 
   // 3️⃣ Merge local and cloud data
-  const merged = aggregate(localResult, cloudResult);
-  return merged;
+  return aggregate(localResult, cloudResult);
 }
 
 /**
@@ -212,9 +286,7 @@ async function handleAnalyseRequest(url) {
 
   const result = await performFullAnalysis(url);
   await storeResult(url, result);
-  if (result.score >= 46) {
-    await notifyContentScript(result);
-  }
+  await syncTabWarning(result);
   return result;
 }
 
@@ -229,11 +301,8 @@ async function analyseAndStore(url, tabId) {
     }
     const result = await performFullAnalysis(url);
     await storeResult(url, result);
-    if (result.score >= 46 && tabId) {
-      chrome.tabs.sendMessage(tabId, {
-        type: 'SHOW_WARNING',
-        data: result,
-      }).catch(() => {});
+    if (tabId) {
+      await syncTabWarning(result, tabId);
     }
   } catch (err) {
     LOG.error('[SentinelX BG] analyseAndStore error:', err);
@@ -302,14 +371,12 @@ async function handlePageInfo(data, sender) {
     else                         result.label = 'Dangerous';
   }
 
-  await storeResult(url, result);
+  await storeResult(url, result, { recordDashboardEvent: false });
+  await createSecurityReport(result, data);
 
-  // Trigger warning banner update if threat rating is elevated
-  if (result.score >= 46 && sender.tab?.id) {
-    chrome.tabs.sendMessage(sender.tab.id, {
-      type: 'SHOW_WARNING',
-      data: result
-    }).catch(() => {});
+  // Trigger warning banner update if threat rating meets sensitivity threshold, or hide if below
+  if (sender.tab?.id) {
+    await syncTabWarning(result, sender.tab.id);
   }
 }
 
@@ -468,6 +535,21 @@ function detectBrandImpersonation(hostname) {
 }
 
 /**
+ * safeDecodeURIComponent(str)
+ * Safely decodes a percent-encoded string. If str contains malformed
+ * encoding sequences that would cause decodeURIComponent to throw a URIError,
+ * it catches the error and returns the original string intact.
+ */
+function safeDecodeURIComponent(str) {
+  if (typeof str !== 'string') return str;
+  try {
+    return decodeURIComponent(str);
+  } catch {
+    return str;
+  }
+}
+
+/**
  * analyseUrl(url)
  * Runs advanced heuristics on a URL to evaluate its threat level.
  *
@@ -512,10 +594,14 @@ function analyseUrl(url) {
   const suspiciousKeywords = [
     'login', 'signin', 'verify', 'secure', 'account',
     'update', 'confirm', 'banking', 'paypal', 'ebay',
-    'password', 'credential', 'free-gift', 'prize'
+    'password', 'credential', 'free-gift', 'prize',
+    'admin', 'hack'
   ];
   const lowerHref = href.toLowerCase();
-  const matchedKeywords = suspiciousKeywords.filter(kw => lowerHref.includes(kw));
+  const decodedHref = safeDecodeURIComponent(href).toLowerCase();
+  const matchedKeywords = suspiciousKeywords.filter(
+    kw => lowerHref.includes(kw) || decodedHref.includes(kw)
+  );
 
   if (matchedKeywords.length > 0) {
     score += 20;
@@ -628,10 +714,12 @@ function analyseUrl(url) {
   // ── 10. Suspicious Characters/Encoding Check ──
   console.log('[SentinelX] Executing Check 10: Suspicious Characters/Encoding');
   // Match genuine percent-encoded byte sequences (%XX where XX = two hex digits).
-  // This correctly identifies obfuscated paths like %68%61%63%6b ("hack"),
-  // %40 (@), %2F (/), %5C (\), %2E (.) without false-positives on bare '%'.
-  const encodedMatches     = url.match(/(%[0-9A-Fa-f]{2})/g) || [];
-  const encodedSymbols     = encodedMatches.length;
+  // Excludes standard space encodings (%20) from the suspicious byte count to prevent
+  // false positives on legitimate search queries or multi-word parameters.
+  const encodedMatches         = url.match(/(%[0-9A-Fa-f]{2})/g) || [];
+  const suspiciousByteMatches  = encodedMatches.filter(m => m.toUpperCase() !== '%20');
+  const encodedSymbols         = suspiciousByteMatches.length;
+
   // Specific high-risk encoded characters — checked independently of the
   // total count so a URL with only one %40 still surfaces the right label.
   const encodedAt          = /(%40)/i.test(url);           // encoded @
@@ -644,7 +732,7 @@ function analyseUrl(url) {
 
   // Verbose detector logs
   console.log('[Detector] URL:', href);
-  console.log('[Detector] Encoded count:', encodedSymbols);
+  console.log('[Detector] Encoded count (suspicious bytes):', encodedSymbols);
   console.log('[Detector] Encoded matches:', encodedMatches);
   console.log('[Detector] Encoded slash (%2F):', encodedSlash);
   console.log('[Detector] Encoded @ (%40):', encodedAt);
@@ -653,7 +741,7 @@ function analyseUrl(url) {
   console.log('[Detector] Contains @:', containsAtSymbol);
   console.log('[Detector] Contains backslash:', containsBackslash);
 
-  // Trigger when: 3+ encoded bytes, or any specifically dangerous encoded char,
+  // Trigger when: 3+ suspicious encoded bytes (excluding benign %20), or any specifically dangerous encoded char,
   // or literal @ / backslash already in hostname / path.
   const hasSuspiciousEncoding =
     encodedSymbols >= 3 ||
@@ -664,7 +752,7 @@ function analyseUrl(url) {
     score += 15;
     let reason = 'Suspicious URL encoding / symbols';
     if (encodedSymbols >= 1) {
-      const sample = encodedMatches.slice(0, 5).join(' ');
+      const sample = suspiciousByteMatches.slice(0, 5).join(' ');
       reason += ` (${encodedSymbols} percent-encoded bytes: ${sample})`;
     }
     if (encodedAt)           reason += ' [%40 encoded @]';
@@ -750,16 +838,19 @@ function buildResult(url, score, checks, isHttps = true) {
  *
  * Key format: sentinelx_scan:<encoded-url>
  */
-/**
- * storeResult(url, result)
- * Saves the analysis result to chrome.storage.local.
- */
-async function storeResult(url, result) {
+async function storeResult(url, result, { recordDashboardEvent = true } = {}) {
   const key = `sentinelx_scan:${encodeURIComponent(url).slice(0, 100)}`;
   await chrome.storage.local.set({ [key]: result });
 
-  // Update rolling log scan history
-  await addToHistory(result);
+  if (result && !result.url) {
+    result.url = url;
+  }
+
+  if (recordDashboardEvent) {
+    // Update Phase 3A history/statistics only for URL scans, not DOM enrichment.
+    await addToHistory(result, url);
+    await createSecurityReport(result);
+  }
 
   const { sentinelx_scan_count = 0 } = await chrome.storage.local.get('sentinelx_scan_count');
   await chrome.storage.local.set({
@@ -770,32 +861,97 @@ async function storeResult(url, result) {
   console.log('[SentinelX BG] Result stored. Total scans:', sentinelx_scan_count + 1);
 }
 
+function extractHostnameFromUrl(u) {
+  try {
+    return new URL(u).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function matchesTargetHost(itemUrl, targetHost) {
+  if (!itemUrl || !targetHost) return false;
+  const host = extractHostnameFromUrl(itemUrl);
+  return host === targetHost || host.endsWith('.' + targetHost);
+}
+
+/** Returns the current site's monitoring data and local analytics for the popup dashboard. */
+async function getDashboardData(url) {
+  try {
+    const dashboard = await getDashboard();
+    const data = dashboard || { ...DEFAULT_DASHBOARD };
+    const targetHost = extractHostnameFromUrl(url);
+
+    const siteDownloads = targetHost
+      ? (data.downloads || []).filter(item => matchesTargetHost(item?.url, targetHost) || matchesTargetHost(item?.referrer, targetHost))
+      : (data.downloads || []);
+
+    const siteRedirects = targetHost
+      ? (data.redirects || []).filter(item => matchesTargetHost(item?.original, targetHost) || matchesTargetHost(item?.final, targetHost))
+      : (data.redirects || []);
+
+    const sitePermissions = targetHost
+      ? (data.permissions || []).filter(item => matchesTargetHost(item?.url, targetHost))
+      : (data.permissions || []);
+
+    const siteSummary = {
+      host: targetHost,
+      downloadCount: siteDownloads.length,
+      redirectCount: siteRedirects.length,
+      permissionCount: sitePermissions.length,
+      downloads: siteDownloads,
+      redirects: siteRedirects,
+      permissions: sitePermissions
+    };
+
+    return {
+      ...data,
+      statistics: {
+        ...DEFAULT_DASHBOARD.statistics,
+        ...(data?.statistics || {})
+      },
+      siteSummary
+    };
+  } catch (err) {
+    console.error('[SentinelX BG] getDashboardData error:', err);
+    return {
+      ...DEFAULT_DASHBOARD,
+      siteSummary: {
+        host: '',
+        downloadCount: 0,
+        redirectCount: 0,
+        permissionCount: 0,
+        downloads: [],
+        redirects: [],
+        permissions: []
+      }
+    };
+  }
+}
+
 /**
  * addToHistory(result)
  * Updates the rolling log history of up to 10 unique scans.
  */
-async function addToHistory(result) {
+async function addToHistory(result, scanUrl) {
   try {
-    const data = await chrome.storage.local.get('sentinelx_history');
-    let history = data.sentinelx_history || [];
-
-    // Filter out previous entry of the same URL to keep it unique
-    history = history.filter(h => h.url !== result.url);
-
-    // Prepend the new scan
-    history.unshift({
-      url: result.url,
-      score: result.score,
-      label: result.label,
-      timestamp: Date.now()
+    const finalUrl = result?.url || scanUrl;
+    await updateDashboard(dashboard => {
+      if (!dashboard.statistics) {
+        dashboard.statistics = { totalScans: 0, dangerousSites: 0, downloads: 0, redirects: 0 };
+      }
+      dashboard.statistics.totalScans = (dashboard.statistics.totalScans || 0) + 1;
+      if (result?.label === 'Dangerous') {
+        dashboard.statistics.dangerousSites = (dashboard.statistics.dangerousSites || 0) + 1;
+      }
+      appendDashboardHistory(dashboard, {
+        timestamp: Date.now(),
+        eventType: 'scan',
+        url: finalUrl,
+        score: result?.score ?? 0,
+        label: result?.label || 'Safe'
+      });
     });
-
-    // Cap at 10 items
-    if (history.length > 10) {
-      history = history.slice(0, 10);
-    }
-
-    await chrome.storage.local.set({ sentinelx_history: history });
   } catch (err) {
     console.error('[SentinelX BG] addToHistory error:', err);
   }
@@ -823,25 +979,66 @@ async function getCachedResult(url) {
 // ───────────────────────────────────────────────────────
 
 /**
+ * Resolves the score threshold for active warning banners
+ * based on user's warningSensitivity setting.
+ */
+function getWarningThreshold(sensitivity = 'balanced') {
+  switch (sensitivity) {
+    case 'low':
+      return 70;
+    case 'high':
+      return 21;
+    case 'balanced':
+    default:
+      return 46;
+  }
+}
+
+/**
+ * syncTabWarning(result, tabId)
+ * Dispatches SHOW_WARNING if score meets the active warningSensitivity threshold,
+ * or HIDE_WARNING if score falls below it.
+ */
+async function syncTabWarning(result, tabId = null) {
+  try {
+    let targetTabId = tabId;
+    if (!targetTabId) {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      targetTabId = activeTab?.id;
+    }
+    if (!targetTabId) return;
+
+    const hostname = extractHostnameFromUrl(result?.url);
+    const isWhitelisted = hostname ? await isDomainWhitelisted(hostname) : false;
+    const settings = await getSettings();
+    const threshold = getWarningThreshold(settings.warningSensitivity);
+    const shouldWarn = !isWhitelisted && result.score >= threshold;
+
+    if (shouldWarn) {
+      await chrome.tabs.sendMessage(targetTabId, {
+        type: 'SHOW_WARNING',
+        data: result,
+      }).catch(() => {
+        console.log('[SentinelX BG] Content script not yet ready for SHOW_WARNING.');
+      });
+    } else {
+      await chrome.tabs.sendMessage(targetTabId, {
+        type: 'HIDE_WARNING',
+      }).catch(() => {
+        // Safe to ignore if banner not present
+      });
+    }
+  } catch (err) {
+    console.error('[SentinelX BG] syncTabWarning error:', err);
+  }
+}
+
+/**
  * notifyContentScript(result)
- * Sends a SHOW_WARNING message to the content script of the active tab.
- * The content script will then inject a warning banner into the page DOM.
+ * Backward-compatible alias for syncTabWarning.
  */
 async function notifyContentScript(result) {
-  try {
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!activeTab?.id) return;
-
-    chrome.tabs.sendMessage(activeTab.id, {
-      type: 'SHOW_WARNING',
-      data: result,
-    }).catch(() => {
-      // The content script might not have loaded yet on this tab — safe to ignore
-      console.log('[SentinelX BG] Content script not yet ready on this tab.');
-    });
-  } catch (err) {
-    console.error('[SentinelX BG] notifyContentScript error:', err);
-  }
+  return syncTabWarning(result);
 }
 
 // ───────────────────────────────────────────────────────

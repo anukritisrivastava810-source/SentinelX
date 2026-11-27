@@ -25,7 +25,7 @@ export async function lookupUrls(urls) {
   const apiKey = await getSafeBrowsingApiKey();
   if (!apiKey) {
     LOG.warn('Safe Browsing API key unavailable – skipping cloud lookup.');
-    return [];
+    return urls.map(u => ({ url: u, threatTypes: [], cacheDurationMs: null, skipped: true, cloudAvailable: false }));
   }
 
   const body = {
@@ -75,6 +75,8 @@ export async function lookupUrls(urls) {
         url: u,
         threatTypes: resultMap[u] || [],
         cacheDurationMs,
+        skipped: false,
+        cloudAvailable: true,
       }));
       return results;
     } catch (e) {
@@ -83,8 +85,8 @@ export async function lookupUrls(urls) {
         await delay(API_RETRY_DELAY_MS * (attempt + 1));
         continue;
       }
-      // after retries, return empty results (treated as no threat).
-      return urls.map(u => ({ url: u, threatTypes: [], cacheDurationMs: null }));
+      // After retries fail, return skipped/unavailable results rather than a false "clean" verdict
+      return urls.map(u => ({ url: u, threatTypes: [], cacheDurationMs: null, skipped: true, cloudAvailable: false, error: true }));
     }
   }
 }

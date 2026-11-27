@@ -100,6 +100,39 @@
           <span>Dangerous</span>
         </div>
       </div>
+
+      <!-- ── AI ANALYSIS SECTION (hidden by default, shown when AI is available) ── -->
+      <div class="ai-section" id="aiSection" style="display:none;">
+        <div class="ai-divider"></div>
+        <button class="ai-btn" id="aiExplainBtn" type="button">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1v1a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-1H2a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"/>
+            <circle cx="7.5" cy="14.5" r="1.5" fill="currentColor" stroke="none"/>
+            <circle cx="16.5" cy="14.5" r="1.5" fill="currentColor" stroke="none"/>
+          </svg>
+          <span id="aiExplainBtnText">AI Analysis</span>
+        </button>
+        <div class="ai-panel" id="aiPanel" style="display:none;">
+          <div class="ai-panel-inner" id="aiPanelInner">
+            <!-- content injected by popup.js -->
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card dashboard-card">
+      <div class="card-label">Website Summary</div>
+      <div class="summary-grid">
+        <div><span>Redirects</span><strong id="redirectCount">0</strong></div>
+        <div><span>Permissions</span><strong id="permissionCount">0</strong></div>
+        <div><span>Downloads</span><strong id="downloadCount">0</strong></div>
+      </div>
+      <div class="activity" id="recentActivity">No monitoring activity yet.</div>
+    </section>
+
+    <section class="card dashboard-card">
+      <div class="card-label">Local Statistics</div>
+      <div class="statistics" id="statistics">Loading statistics…</div>
     </section>
 
     <!-- ── SECURITY CHECKS CARD ── -->
@@ -138,8 +171,9 @@
           <circle cx="12" cy="12" r="10"/>
           <polyline points="12 6 12 12 16 14"/>
         </svg>
-        Recent Scans
+        Recent Scans <button class="text-button" id="clearHistory">Clear</button>
       </div>
+      <div class="history-tools"><input id="historySearch" type="search" placeholder="Search scans" /><select id="historyFilter"><option value="all">All risk levels</option><option>Safe</option><option>Low Risk</option><option>Moderate Risk</option><option>Dangerous</option></select><select id="historySort"><option value="newest">Newest</option><option value="highest">Highest risk</option><option value="lowest">Lowest risk</option></select></div>
       <div class="history-empty" id="historyEmpty">No recent scans logged.</div>
       <ul class="history-list" id="historyList"></ul>
     </section>
@@ -151,9 +185,9 @@
   ════════════════════════════════════════════ -->
   <footer class="footer">
     <span class="footer-time" id="scanTime">—</span>
-    <span class="footer-brand">SentinelX v1.0</span>
+    <a class="footer-brand" href="../options/options.html" target="_blank">Settings</a>
   </footer>
 
-  <script src="popup.js"></script>
+  <script type="module" src="popup.js"></script>
 </body>
 </html>
